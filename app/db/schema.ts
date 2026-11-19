@@ -9,7 +9,7 @@ import {
 } from "drizzle-orm/sqlite-core";
 
 export enum UserRole {
-  Student = "student",
+  Learner = "learner",
   Instructor = "instructor",
   Admin = "admin",
 }
@@ -32,7 +32,7 @@ export enum QuestionType {
 }
 
 export enum RefundStatus {
-  Requested = "requested",
+  Open = "open",
   Approved = "approved",
   Declined = "declined",
 }
@@ -239,7 +239,7 @@ export const refunds = sqliteTable(
     status: text("status")
       .notNull()
       .$type<RefundStatus>()
-      .default(RefundStatus.Requested),
+      .default(RefundStatus.Open),
     // The learner's own words, in the box on the course page.
     reason: text("reason").notNull(),
     // Null until someone approves — a declined request refunds nothing.
