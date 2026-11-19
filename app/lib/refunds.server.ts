@@ -1,11 +1,14 @@
-import { and, eq, inArray, isNotNull, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNotNull, isNull, sql } from "drizzle-orm";
 import { db } from "~/db";
 import {
+  courses,
   coupons,
+  enrollments,
   lessons,
   modules,
   purchases,
   refunds,
+  users,
   videoWatchEvents,
   RefundStatus,
 } from "~/db/schema";
@@ -174,4 +177,218 @@ export function buildRefundRequestEmail(input: {
       "— The Cadence team",
     ].join("\n"),
   };
+}
+
+// ─── Team Purchase seats ───
+
+export type SeatClaimBlock = "voided" | "refund-open";
+
+/**
+ * Why a seat from a Team Purchase cannot be claimed right now, or null if it
+ * can. Seats are frozen while the Team Purchase has an Open Refund Request,
+ * and voided for good once it is Refunded (docs/adr/0004).
+ */
+export function getSeatClaimBlock(seat: {
+  voidedAt: string | null;
+  purchaseId: number;
+}): SeatClaimBlock | null {
+  if (seat.voidedAt !== null) return "voided";
+  if (hasOpenRefundRequest(seat.purchaseId)) return "refund-open";
+  return null;
+}
+
+// ─── Deciding a Refund Request ───
+
+export type RefundDecision =
+  | { kind: "approve"; decisionNote: string | null }
+  | { kind: "decline"; decisionNote: string };
+
+export type RefundDecisionError = "not-found" | "not-open" | "own-request";
+
+type DecidedRefundRequest = {
+  learnerName: string;
+  learnerEmail: string;
+  courseTitle: string;
+  refundAmount: number;
+};
+
+/**
+ * A Platform Admin approves or declines an Open Refund Request. Eligibility is
+ * deliberately not re-checked here (docs/adr/0001).
+ *
+ * Approving records the Refund for the full Refund Amount. For a Team Purchase
+ * it voids every unclaimed seat (docs/adr/0004); otherwise it turns the
+ * Learner's Enrollment into an Ended Enrollment (docs/adr/0003). No money
+ * moves: there is no payment provider yet.
+ */
+export function decideRefundRequest(
+  refundRequestId: number,
+  platformAdminId: number,
+  decision: RefundDecision,
+  now: Date = new Date()
+):
+  | { ok: true; decided: DecidedRefundRequest }
+  | { ok: false; error: RefundDecisionError } {
+  return db.transaction((tx) => {
+    const row = tx
+      .select({
+        status: refunds.status,
+        purchaseId: purchases.id,
+        learnerId: purchases.userId,
+        courseId: purchases.courseId,
+        amountPaid: purchases.amountPaid,
+        learnerName: users.name,
+        learnerEmail: users.email,
+        courseTitle: courses.title,
+      })
+      .from(refunds)
+      .innerJoin(purchases, eq(refunds.purchaseId, purchases.id))
+      .innerJoin(users, eq(purchases.userId, users.id))
+      .innerJoin(courses, eq(purchases.courseId, courses.id))
+      .where(eq(refunds.id, refundRequestId))
+      .get();
+
+    if (!row) return { ok: false, error: "not-found" } as const;
+    if (row.status !== RefundStatus.Open) {
+      return { ok: false, error: "not-open" } as const;
+    }
+    if (row.learnerId === platformAdminId) {
+      return { ok: false, error: "own-request" } as const;
+    }
+
+    const resolvedAt = now.toISOString();
+    const approved = decision.kind === "approve";
+
+    tx.update(refunds)
+      .set({
+        status: approved ? RefundStatus.Approved : RefundStatus.Declined,
+        amountRefunded: approved ? row.amountPaid : null,
+        decisionNote: decision.decisionNote,
+        resolvedAt,
+        resolvedByUserId: platformAdminId,
+      })
+      .where(eq(refunds.id, refundRequestId))
+      .run();
+
+    if (approved) {
+      const isTeamPurchase =
+        tx
+          .select({ id: coupons.id })
+          .from(coupons)
+          .where(eq(coupons.purchaseId, row.purchaseId))
+          .get() !== undefined;
+
+      if (isTeamPurchase) {
+        tx.update(coupons)
+          .set({ voidedAt: resolvedAt })
+          .where(
+            and(
+              eq(coupons.purchaseId, row.purchaseId),
+              isNull(coupons.redeemedAt),
+              isNull(coupons.voidedAt)
+            )
+          )
+          .run();
+      } else {
+        tx.update(enrollments)
+          .set({ endedAt: resolvedAt })
+          .where(
+            and(
+              eq(enrollments.userId, row.learnerId),
+              eq(enrollments.courseId, row.courseId),
+              isNull(enrollments.endedAt)
+            )
+          )
+          .run();
+      }
+    }
+
+    return {
+      ok: true,
+      decided: {
+        learnerName: row.learnerName,
+        learnerEmail: row.learnerEmail,
+        courseTitle: row.courseTitle,
+        refundAmount: row.amountPaid,
+      },
+    } as const;
+  });
+}
+
+export function buildRefundDecisionEmail(
+  decided: DecidedRefundRequest,
+  decision: RefundDecision
+) {
+  const approved = decision.kind === "approve";
+  const noteLines = decision.decisionNote
+    ? ["", "A note from our team:", decision.decisionNote]
+    : [];
+
+  return {
+    to: decided.learnerEmail,
+    subject: approved
+      ? `Refund approved — ${decided.courseTitle}`
+      : `Refund request declined — ${decided.courseTitle}`,
+    body: [
+      `Hi ${decided.learnerName},`,
+      "",
+      approved
+        ? `We have approved your refund request for "${decided.courseTitle}". We are refunding ${formatPrice(decided.refundAmount)}, the amount you paid, and your access to the course has ended. You can buy it again at any time, and your progress will still be there.`
+        : `We have declined your refund request for "${decided.courseTitle}". You still have full access to the course.`,
+      ...noteLines,
+      "",
+      "— The Cadence team",
+    ].join("\n"),
+  };
+}
+
+// ─── Listings ───
+
+/** Open Refund Requests for the Platform Admin queue, oldest first. */
+export function listOpenRefundRequests() {
+  return db
+    .select({
+      id: refunds.id,
+      reason: refunds.reason,
+      requestedAt: refunds.requestedAt,
+      purchaseId: purchases.id,
+      purchasedAt: purchases.createdAt,
+      refundAmount: purchases.amountPaid,
+      learnerId: users.id,
+      learnerName: users.name,
+      learnerEmail: users.email,
+      courseTitle: courses.title,
+      courseSlug: courses.slug,
+      isTeamPurchase: sql<number>`exists (select 1 from ${coupons} where ${coupons.purchaseId} = ${purchases.id})`,
+    })
+    .from(refunds)
+    .innerJoin(purchases, eq(refunds.purchaseId, purchases.id))
+    .innerJoin(users, eq(purchases.userId, users.id))
+    .innerJoin(courses, eq(purchases.courseId, courses.id))
+    .where(eq(refunds.status, RefundStatus.Open))
+    .orderBy(asc(refunds.requestedAt), asc(refunds.id))
+    .all()
+    .map((row) => ({ ...row, isTeamPurchase: Boolean(row.isTeamPurchase) }));
+}
+
+/** Every Refund Request a Learner has raised, newest first. */
+export function listRefundRequestsForLearner(learnerId: number) {
+  return db
+    .select({
+      id: refunds.id,
+      status: refunds.status,
+      reason: refunds.reason,
+      decisionNote: refunds.decisionNote,
+      requestedAt: refunds.requestedAt,
+      resolvedAt: refunds.resolvedAt,
+      refundAmount: purchases.amountPaid,
+      courseTitle: courses.title,
+      courseSlug: courses.slug,
+    })
+    .from(refunds)
+    .innerJoin(purchases, eq(refunds.purchaseId, purchases.id))
+    .innerJoin(courses, eq(purchases.courseId, courses.id))
+    .where(eq(purchases.userId, learnerId))
+    .orderBy(desc(refunds.requestedAt), desc(refunds.id))
+    .all();
 }

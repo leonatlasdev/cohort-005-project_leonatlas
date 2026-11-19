@@ -10,8 +10,17 @@ vi.mock("~/db", () => ({
   },
 }));
 
-const { checkRefundEligibility, buildRefundRequestEmail } = await import(
-  "./refunds.server"
+const {
+  checkRefundEligibility,
+  buildRefundRequestEmail,
+  buildRefundDecisionEmail,
+  decideRefundRequest,
+  getSeatClaimBlock,
+  listOpenRefundRequests,
+  listRefundRequestsForLearner,
+} = await import("./refunds.server");
+const { enrollLearner, findActiveEnrollment } = await import(
+  "./enrollments.server"
 );
 
 let learnerId: number;
@@ -185,5 +194,226 @@ describe("buildRefundRequestEmail", () => {
     expect(`${email.subject} ${email.body}`).not.toMatch(
       /reversal|chargeback|cancel/i
     );
+  });
+});
+
+describe("deciding a Refund Request", () => {
+  let platformAdminId: number;
+
+  beforeEach(() => {
+    platformAdminId = testDb
+      .insert(schema.users)
+      .values({
+        name: "Platform Admin",
+        email: "platform-admin@example.com",
+        role: schema.UserRole.Admin,
+      })
+      .returning()
+      .get().id;
+  });
+
+  function raiseRefundRequest(purchaseId: number) {
+    return testDb
+      .insert(schema.refunds)
+      .values({ purchaseId, reason: "Not what I expected." })
+      .returning()
+      .get();
+  }
+
+  function getRefundRequest(id: number) {
+    const row = testDb
+      .select()
+      .from(schema.refunds)
+      .all()
+      .find((refundRequest) => refundRequest.id === id);
+    if (!row) throw new Error("refund request missing");
+    return row;
+  }
+
+  function createTeamPurchase(seatCount: number) {
+    const purchase = buy(15000);
+    const team = testDb.insert(schema.teams).values({}).returning().get();
+    const seats = Array.from({ length: seatCount }, (_, i) =>
+      testDb
+        .insert(schema.coupons)
+        .values({
+          teamId: team.id,
+          courseId,
+          code: `SEAT-${i}`,
+          purchaseId: purchase.id,
+        })
+        .returning()
+        .get()
+    );
+    return { purchase, seats };
+  }
+
+  it("approving records the full Refund and ends the Enrollment, keeping it", () => {
+    const purchase = buy(5000);
+    enrollLearner(learnerId, courseId);
+    const refundRequest = raiseRefundRequest(purchase.id);
+
+    const result = decideRefundRequest(
+      refundRequest.id,
+      platformAdminId,
+      { kind: "approve", decisionNote: null },
+      daysAfterPurchase(20)
+    );
+
+    expect(result).toMatchObject({ ok: true, decided: { refundAmount: 5000 } });
+    expect(getRefundRequest(refundRequest.id)).toMatchObject({
+      status: schema.RefundStatus.Approved,
+      amountRefunded: 5000,
+      resolvedByUserId: platformAdminId,
+      decisionNote: null,
+    });
+    // An Ended Enrollment: no access, but the row (and progress) survives.
+    expect(findActiveEnrollment(learnerId, courseId)).toBeUndefined();
+    expect(testDb.select().from(schema.enrollments).all()).toHaveLength(1);
+  });
+
+  it("approves after the Refund Window has closed, without re-checking eligibility", () => {
+    const purchase = buy(5000);
+    const refundRequest = raiseRefundRequest(purchase.id);
+
+    expect(
+      decideRefundRequest(
+        refundRequest.id,
+        platformAdminId,
+        { kind: "approve", decisionNote: null },
+        daysAfterPurchase(60)
+      )
+    ).toMatchObject({ ok: true });
+  });
+
+  it("declining keeps the Enrollment and stores the Decision Note", () => {
+    const purchase = buy(5000);
+    enrollLearner(learnerId, courseId);
+    const refundRequest = raiseRefundRequest(purchase.id);
+
+    decideRefundRequest(refundRequest.id, platformAdminId, {
+      kind: "decline",
+      decisionNote: "You finished the course.",
+    });
+
+    expect(getRefundRequest(refundRequest.id)).toMatchObject({
+      status: schema.RefundStatus.Declined,
+      amountRefunded: null,
+      decisionNote: "You finished the course.",
+    });
+    expect(findActiveEnrollment(learnerId, courseId)).toBeDefined();
+  });
+
+  it("refuses a Refund Request that has already been decided", () => {
+    const refundRequest = raiseRefundRequest(buy(5000).id);
+    const decline = {
+      kind: "decline",
+      decisionNote: "No.",
+    } as const;
+
+    decideRefundRequest(refundRequest.id, platformAdminId, decline);
+
+    expect(
+      decideRefundRequest(refundRequest.id, platformAdminId, decline)
+    ).toEqual({ ok: false, error: "not-open" });
+  });
+
+  it("refuses a Platform Admin deciding their own Refund Request", () => {
+    const refundRequest = raiseRefundRequest(buy(5000).id);
+
+    expect(
+      decideRefundRequest(refundRequest.id, learnerId, {
+        kind: "approve",
+        decisionNote: null,
+      })
+    ).toEqual({ ok: false, error: "own-request" });
+    expect(getRefundRequest(refundRequest.id).status).toBe(
+      schema.RefundStatus.Open
+    );
+  });
+
+  it("freezes a Team Purchase's seats while Open, and voids unclaimed ones on approval", () => {
+    const { purchase, seats } = createTeamPurchase(2);
+    const refundRequest = raiseRefundRequest(purchase.id);
+
+    expect(getSeatClaimBlock(seats[0])).toBe("refund-open");
+
+    decideRefundRequest(refundRequest.id, platformAdminId, {
+      kind: "approve",
+      decisionNote: null,
+    });
+
+    const after = testDb.select().from(schema.coupons).all();
+    expect(after.every((seat) => seat.voidedAt !== null)).toBe(true);
+    expect(after.map((seat) => getSeatClaimBlock(seat))).toEqual([
+      "voided",
+      "voided",
+    ]);
+  });
+
+  it("unfreezes a Team Purchase's seats when its Refund Request is Declined", () => {
+    const { purchase, seats } = createTeamPurchase(1);
+    const refundRequest = raiseRefundRequest(purchase.id);
+
+    decideRefundRequest(refundRequest.id, platformAdminId, {
+      kind: "decline",
+      decisionNote: "Seats are still useful to your team.",
+    });
+
+    expect(getSeatClaimBlock(seats[0])).toBeNull();
+  });
+
+  it("lists Open requests oldest first, and every request for the Learner", () => {
+    const first = raiseRefundRequest(buy(5000).id);
+    const second = raiseRefundRequest(buy(5000).id);
+    decideRefundRequest(first.id, platformAdminId, {
+      kind: "decline",
+      decisionNote: "Too late.",
+    });
+
+    expect(listOpenRefundRequests().map((row) => row.id)).toEqual([second.id]);
+    expect(
+      listRefundRequestsForLearner(learnerId).map((row) => row.status).sort()
+    ).toEqual([schema.RefundStatus.Declined, schema.RefundStatus.Open]);
+  });
+
+  it("emails the Decision Note with the decision", () => {
+    const decided = {
+      learnerName: "Ada",
+      learnerEmail: "ada@example.com",
+      courseTitle: "Test Course",
+      refundAmount: 2500,
+    };
+
+    const declined = buildRefundDecisionEmail(decided, {
+      kind: "decline",
+      decisionNote: "You watched most of it.",
+    });
+    expect(declined.subject).toBe("Refund request declined — Test Course");
+    expect(declined.body).toContain("You watched most of it.");
+
+    const approved = buildRefundDecisionEmail(decided, {
+      kind: "approve",
+      decisionNote: null,
+    });
+    expect(approved.subject).toBe("Refund approved — Test Course");
+    expect(approved.body).toContain("$25.00, the amount you paid");
+    expect(approved.body).not.toContain("A note from our team");
+  });
+});
+
+describe("enrollLearner", () => {
+  it("revives an Ended Enrollment instead of creating a second one", () => {
+    const enrollment = enrollLearner(learnerId, courseId);
+    testDb
+      .update(schema.enrollments)
+      .set({ endedAt: new Date().toISOString() })
+      .run();
+
+    const revived = enrollLearner(learnerId, courseId);
+
+    expect(revived.id).toBe(enrollment.id);
+    expect(revived.endedAt).toBeNull();
+    expect(testDb.select().from(schema.enrollments).all()).toHaveLength(1);
   });
 });

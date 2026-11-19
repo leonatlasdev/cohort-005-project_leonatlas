@@ -1,5 +1,6 @@
 import { data } from "react-router";
 import { eq, and } from "drizzle-orm";
+import { isActiveEnrollment } from "~/lib/enrollments.server";
 import { db } from "~/db";
 import {
   UserRole,
@@ -25,7 +26,11 @@ function findEnrollment(userId: number, courseId: number) {
     .select()
     .from(enrollments)
     .where(
-      and(eq(enrollments.userId, userId), eq(enrollments.courseId, courseId))
+      and(
+        eq(enrollments.userId, userId),
+        eq(enrollments.courseId, courseId),
+        isActiveEnrollment()
+      )
     )
     .get();
 }
