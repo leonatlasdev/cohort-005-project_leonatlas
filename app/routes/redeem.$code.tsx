@@ -12,7 +12,18 @@ import { Ticket, AlertCircle, CheckCircle2, Globe } from "lucide-react";
 import { data } from "react-router";
 import { db } from "~/db";
 import { purchases, coupons, courses, enrollments } from "~/db/schema";
-import { eq, and } from "drizzle-orm";
+import { eq } from "drizzle-orm";
+import {
+  enrollLearner,
+  findActiveEnrollment,
+} from "~/lib/enrollments.server";
+import { getSeatClaimBlock, type SeatClaimBlock } from "~/lib/refunds.server";
+
+const seatClaimBlockMessages: Record<SeatClaimBlock, string> = {
+  voided: "This seat was voided when its team purchase was refunded.",
+  "refund-open":
+    "This seat can't be claimed while a refund request for its team purchase is open.",
+};
 
 function getCourseById(id: number) {
   return db.select().from(courses).where(eq(courses.id, id)).get();
@@ -23,15 +34,7 @@ function getCouponByCode(code: string) {
 }
 
 function isUserEnrolled(userId: number, courseId: number) {
-  const existing = db
-    .select()
-    .from(enrollments)
-    .where(
-      and(eq(enrollments.userId, userId), eq(enrollments.courseId, courseId))
-    )
-    .get();
-
-  return !!existing;
+  return !!findActiveEnrollment(userId, courseId);
 }
 
 type RedeemResult =
@@ -52,18 +55,12 @@ function redeemCoupon(
     return { ok: false, error: "Coupon has already been redeemed" };
   }
 
-  const existingEnrollment = db
-    .select()
-    .from(enrollments)
-    .where(
-      and(
-        eq(enrollments.userId, userId),
-        eq(enrollments.courseId, coupon.courseId)
-      )
-    )
-    .get();
+  const seatClaimBlock = getSeatClaimBlock(coupon);
+  if (seatClaimBlock) {
+    return { ok: false, error: seatClaimBlockMessages[seatClaimBlock] };
+  }
 
-  if (existingEnrollment) {
+  if (isUserEnrolled(userId, coupon.courseId)) {
     return { ok: false, error: "You are already enrolled in this course" };
   }
 
@@ -89,11 +86,8 @@ function redeemCoupon(
     .where(eq(coupons.id, coupon.id))
     .run();
 
-  const enrollment = db
-    .insert(enrollments)
-    .values({ userId, courseId: coupon.courseId })
-    .returning()
-    .get();
+  // Revives an Ended Enrollment from an earlier Refund, keeping progress.
+  const enrollment = enrollLearner(userId, coupon.courseId);
 
   return { ok: true, enrollment };
 }
@@ -136,10 +130,14 @@ export async function loader({ params, request }: Route.LoaderArgs) {
 
   const alreadyRedeemed = coupon.redeemedByUserId !== null;
   const alreadyEnrolled = isUserEnrolled(currentUserId, coupon.courseId);
+  const seatClaimBlock = alreadyRedeemed ? null : getSeatClaimBlock(coupon);
+  const unavailableMessage = seatClaimBlock
+    ? seatClaimBlockMessages[seatClaimBlock]
+    : null;
 
   // Check country mismatch upfront so we can show a clear message
   let countryMismatch = false;
-  if (!alreadyRedeemed && !alreadyEnrolled) {
+  if (!alreadyRedeemed && !alreadyEnrolled && !seatClaimBlock) {
     const userCountry = await resolveCountry(request);
     const purchase = db
       .select()
@@ -156,6 +154,7 @@ export async function loader({ params, request }: Route.LoaderArgs) {
     code,
     alreadyRedeemed,
     alreadyEnrolled,
+    unavailableMessage,
     countryMismatch,
   };
 }
@@ -194,8 +193,14 @@ export default function Redeem({
   loaderData,
   actionData,
 }: Route.ComponentProps) {
-  const { course, code, alreadyRedeemed, alreadyEnrolled, countryMismatch } =
-    loaderData;
+  const {
+    course,
+    code,
+    alreadyRedeemed,
+    alreadyEnrolled,
+    unavailableMessage,
+    countryMismatch,
+  } = loaderData;
   const fetcher = useFetcher();
   const isSubmitting = fetcher.state !== "idle";
 
@@ -208,7 +213,6 @@ export default function Redeem({
   }, [fetcher.data, actionData]);
 
   // Determine which state to show
-  const canRedeem = !alreadyRedeemed && !alreadyEnrolled && !countryMismatch;
 
   return (
     <div className="mx-auto max-w-2xl p-6 lg:p-8">
@@ -240,6 +244,16 @@ export default function Redeem({
               <p className="mt-2 text-sm text-muted-foreground">
                 Someone has already claimed this seat. Please ask the person who
                 shared this link for a new coupon.
+              </p>
+            </div>
+          ) : unavailableMessage ? (
+            <div className="rounded-lg bg-destructive/10 p-4">
+              <div className="flex items-center justify-center gap-2 text-destructive">
+                <AlertCircle className="size-5" />
+                <span className="font-medium">This seat is not available</span>
+              </div>
+              <p className="mt-2 text-sm text-muted-foreground">
+                {unavailableMessage}
               </p>
             </div>
           ) : alreadyEnrolled ? (
